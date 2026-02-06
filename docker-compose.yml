@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  youtube-api:
+    container_name: youtube-tools-api
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./main.py:/app/main.py
+      - ./downloads:/app/downloads
+    restart: unless-stopped
+    networks:
+      - youtube-network
+
+networks:
+  youtube-network:
+    driver: bridge
