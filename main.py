@@ -5,6 +5,7 @@ A production-ready FastAPI microservice that retrieves transcripts from YouTube 
 Uses youtube_transcript_api with proxy support, retry mechanism, and YouTube's built-in translation.
 """
 
+import asyncio
 import logging
 import re
 import time
@@ -230,9 +231,12 @@ async def convert_to_mp3(video_url: str, background_tasks: BackgroundTasks):
             'no_warnings': True,
         }
         
-        # Download and convert
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
+        # Download and convert (run in thread pool to avoid blocking)
+        def download_video():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url])
+        
+        await asyncio.to_thread(download_video)
             
         if not os.path.exists(mp3_file):
             raise HTTPException(status_code=500, detail="Conversion failed: Output file not found")
@@ -250,3 +254,4 @@ async def convert_to_mp3(video_url: str, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Conversion error: {e}")
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
