@@ -8,11 +8,14 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
+    env_file:
+      - .env
     environment:
       - LOG_LEVEL=INFO
     volumes:
       - ./main.py:/app/main.py
       - ./downloads:/app/downloads
+      - ./.env:/app/.env
     restart: unless-stopped
     networks:
       - youtube-network

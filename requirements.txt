@@ -4,4 +4,6 @@ pydantic>=2.5.0
 youtube-transcript-api
 fake-useragent
 yt-dlp
-static-ffmpeg
+google-api-python-client
+python-dotenv
+cachetools
