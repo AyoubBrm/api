@@ -29,7 +29,7 @@ app = FastAPI()
 ytt_api = YouTubeTranscriptApi()
 
 # Max retries for getting a good request/handling rate limits
-MAX_RETRIES = 10
+MAX_RETRIES = 5
 
 # Initialize UserAgent
 ua = UserAgent()
@@ -172,7 +172,7 @@ async def transcript(video_url: str, target_language: str = "en"):
             )
         except Exception as e:
             logger.error(f"Failed after {MAX_RETRIES} retries: {e}")
-            raise HTTPException(status_code=404, detail="Sorry, a transcript isn't available for this video.")
+            raise HTTPException(status_code=200, detail="Sorry, a transcript isn't available for this video.")
         
         # Build full transcript text
         full_transcript = " ".join([seg['text'] for seg in segments])
@@ -187,12 +187,12 @@ async def transcript(video_url: str, target_language: str = "en"):
         }
     
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=200, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=200, detail=str(e))
 
 # --- YouTube Search Feature (yt-dlp with Caching Cursor) ---
 import hashlib
@@ -294,7 +294,7 @@ async def search_youtube(query: str = None, cursor: str = None, limit: int = 50)
             
             if not cache_data:
                 raise HTTPException(
-                    status_code=400, 
+                    status_code=200, 
                     detail="Cursor expired or invalid. Please start a new search."
                 )
             
@@ -326,7 +326,7 @@ async def search_youtube(query: str = None, cursor: str = None, limit: int = 50)
             
         else:
             raise HTTPException(
-                status_code=400, 
+                status_code=200, 
                 detail="Either 'query' or 'cursor' parameter is required"
             )
         
@@ -356,7 +356,7 @@ async def search_youtube(query: str = None, cursor: str = None, limit: int = 50)
         raise
     except Exception as e:
         logger.error(f"Search error: {e}")
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+        raise HTTPException(status_code=200, detail=f"Search failed: {str(e)}")
 
 
 # --- MP3 Conversion Feature ---
@@ -462,12 +462,12 @@ async def convert_to_mp3(video_url: str, background_tasks: BackgroundTasks):
             )
         except asyncio.TimeoutError:
             logger.error(f"Download timeout for video: {video_id}")
-            raise HTTPException(status_code=504, detail="Download timeout - video may be too long or network is slow")
+            raise HTTPException(status_code=200, detail="Download timeout - video may be too long or network is slow")
         
         # Verify file exists
         if not os.path.exists(internal_file):
             logger.error(f"Output file not found: {internal_file}")
-            raise HTTPException(status_code=500, detail="Conversion failed: Output file not found")
+            raise HTTPException(status_code=200, detail="Conversion failed: Output file not found")
         
         # Schedule cleanup after response
         background_tasks.add_task(cleanup_file, internal_file)
@@ -481,10 +481,10 @@ async def convert_to_mp3(video_url: str, background_tasks: BackgroundTasks):
         )
         
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=200, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Conversion error: {e}")
-        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+        raise HTTPException(status_code=200, detail=f"Conversion failed: {str(e)}")
 
