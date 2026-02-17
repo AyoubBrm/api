@@ -14,7 +14,9 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from fake_useragent import UserAgent
 from fastapi import FastAPI, HTTPException
 import yt_dlp
+import yt_dlp
 from concurrent.futures import ThreadPoolExecutor
+import json
 
 # Create dedicated thread pool for transcript operations (non-blocking)
 transcript_executor = ThreadPoolExecutor(max_workers=10)
@@ -206,14 +208,166 @@ async def transcript(video_url: str, target_language: str = "en"):
             "code" : "500"
         }
 
-# --- YouTube Search Feature (yt-dlp with Caching Cursor) ---
+# --- YouTube Search Feature (youtube-search-python with Caching Cursor) ---
 import hashlib
 from cachetools import TTLCache
+import httpx
+from youtubesearchpython import VideosSearch, Search
 
+# Monkey patch httpx.post to fix youtube-search-python compatibility issue
+# youtube-search-python passes specific 'proxies' kwarg which httpx removed support for in recent versions
+# We capture and ignore it here since we aren't using proxies for this search
+_original_httpx_post = httpx.post
+def _patched_httpx_post(url, **kwargs):
+    if 'proxies' in kwargs:
+        # Remove the 'proxies' argument as it's not supported by this version of httpx.post
+        # If proxies were needed, they should be configured via Client, but current usage is proxy-less.
+        kwargs.pop('proxies', None)
+    return _original_httpx_post(url, **kwargs)
+
+httpx.post = _patched_httpx_post
+
+# =============================================================================
+# Monkey patches for youtube-search-python library bugs
+# The library has multiple NoneType crash points that we fix here.
+# =============================================================================
+from youtubesearchpython.core.search import SearchCore
+from youtubesearchpython.core.constants import *
+from youtubesearchpython.handlers.componenthandler import ComponentHandler
+from youtubesearchpython.handlers.requesthandler import RequestHandler
+
+# 1) Fix _getVideoComponent: crashes with "can only concatenate str (not NoneType) to str"
+#    when videoId or channelId is None (lines 31-32 of componenthandler.py)
+_original_getVideoComponent = ComponentHandler._getVideoComponent
+def _patched_getVideoComponent(self, element: dict, shelfTitle: str = None) -> dict:
+    try:
+        return _original_getVideoComponent(self, element, shelfTitle)
+    except (TypeError, KeyError):
+        # Fallback: build a safe minimal component
+        video = element.get(videoElementKey, {})
+        vid = self._getValue(video, ['videoId']) or ''
+        ch_name = self._getValue(video, ['ownerText', 'runs', 0, 'text'])
+        ch_id = self._getValue(video, ['ownerText', 'runs', 0, 'navigationEndpoint', 'browseEndpoint', 'browseId']) or ''
+        return {
+            'type': 'video',
+            'id': vid,
+            'title': self._getValue(video, ['title', 'runs', 0, 'text']),
+            'publishedTime': self._getValue(video, ['publishedTimeText', 'simpleText']),
+            'duration': self._getValue(video, ['lengthText', 'simpleText']),
+            'viewCount': {
+                'text': self._getValue(video, ['viewCountText', 'simpleText']),
+                'short': self._getValue(video, ['shortViewCountText', 'simpleText']),
+            },
+            'thumbnails': self._getValue(video, ['thumbnail', 'thumbnails']),
+            'richThumbnail': self._getValue(video, ['richThumbnail', 'movingThumbnailRenderer', 'movingThumbnailDetails', 'thumbnails', 0]),
+            'descriptionSnippet': self._getValue(video, ['detailedMetadataSnippets', 0, 'snippetText', 'runs']),
+            'channel': {
+                'name': ch_name,
+                'id': ch_id,
+                'thumbnails': self._getValue(video, ['channelThumbnailSupportedRenderers', 'channelThumbnailWithLinkRenderer', 'thumbnail', 'thumbnails']),
+                'link': ('https://www.youtube.com/channel/' + ch_id) if ch_id else None,
+            },
+            'accessibility': {
+                'title': self._getValue(video, ['title', 'accessibility', 'accessibilityData', 'label']),
+                'duration': self._getValue(video, ['lengthText', 'accessibility', 'accessibilityData', 'label']),
+            },
+            'link': ('https://www.youtube.com/watch?v=' + vid) if vid else None,
+            'shelfTitle': shelfTitle,
+        }
+ComponentHandler._getVideoComponent = _patched_getVideoComponent
+
+# 2) Fix _getChannelComponent: same string concat crash
+_original_getChannelComponent = ComponentHandler._getChannelComponent
+def _patched_getChannelComponent(self, element: dict) -> dict:
+    try:
+        return _original_getChannelComponent(self, element)
+    except (TypeError, KeyError):
+        channel = element.get(channelElementKey, {})
+        ch_id = self._getValue(channel, ['channelId']) or ''
+        return {
+            'type': 'channel',
+            'id': ch_id,
+            'title': self._getValue(channel, ['title', 'simpleText']),
+            'thumbnails': self._getValue(channel, ['thumbnail', 'thumbnails']),
+            'videoCount': self._getValue(channel, ['videoCountText', 'runs', 0, 'text']),
+            'descriptionSnippet': self._getValue(channel, ['descriptionSnippet', 'runs']),
+            'subscribers': self._getValue(channel, ['subscriberCountText', 'simpleText']),
+            'link': ('https://www.youtube.com/channel/' + ch_id) if ch_id else None,
+        }
+ComponentHandler._getChannelComponent = _patched_getChannelComponent
+
+# 3) Fix _getPlaylistComponent: same string concat crash
+_original_getPlaylistComponent = ComponentHandler._getPlaylistComponent
+def _patched_getPlaylistComponent(self, element: dict) -> dict:
+    try:
+        return _original_getPlaylistComponent(self, element)
+    except (TypeError, KeyError):
+        playlist = element.get(playlistElementKey, {})
+        pl_id = self._getValue(playlist, ['playlistId']) or ''
+        ch_name = self._getValue(playlist, ['shortBylineText', 'runs', 0, 'text'])
+        ch_id = self._getValue(playlist, ['shortBylineText', 'runs', 0, 'navigationEndpoint', 'browseEndpoint', 'browseId']) or ''
+        return {
+            'type': 'playlist',
+            'id': pl_id,
+            'title': self._getValue(playlist, ['title', 'simpleText']),
+            'videoCount': self._getValue(playlist, ['videoCount']),
+            'channel': {
+                'name': ch_name,
+                'id': ch_id,
+                'link': ('https://www.youtube.com/channel/' + ch_id) if ch_id else None,
+            },
+            'thumbnails': self._getValue(playlist, ['thumbnailRenderer', 'playlistVideoThumbnailRenderer', 'thumbnail', 'thumbnails']),
+            'link': ('https://www.youtube.com/playlist?list=' + pl_id) if pl_id else None,
+        }
+ComponentHandler._getPlaylistComponent = _patched_getPlaylistComponent
+
+# 4) Fix _getComponents: shelf elements can be None, responseSource can be None
+def _patched_getComponents(self, findVideos: bool, findChannels: bool, findPlaylists: bool) -> None:
+    self.resultComponents = []
+    if not self.responseSource:
+        return
+    for element in self.responseSource:
+        if not isinstance(element, dict):
+            continue
+        if videoElementKey in element.keys() and findVideos:
+            self.resultComponents.append(self._getVideoComponent(element))
+        if channelElementKey in element.keys() and findChannels:
+            self.resultComponents.append(self._getChannelComponent(element))
+        if playlistElementKey in element.keys() and findPlaylists:
+            self.resultComponents.append(self._getPlaylistComponent(element))
+        if shelfElementKey in element.keys() and findVideos:
+            shelf = self._getShelfComponent(element)
+            shelf_elements = shelf.get('elements') if shelf else None
+            if shelf_elements:
+                for shelfElement in shelf_elements:
+                    self.resultComponents.append(
+                        self._getVideoComponent(shelfElement, shelfTitle=shelf.get('title')))
+        if richItemKey in element.keys() and findVideos:
+            richItemElement = self._getValue(element, [richItemKey, 'content'])
+            if richItemElement and isinstance(richItemElement, dict) and videoElementKey in richItemElement.keys():
+                self.resultComponents.append(self._getVideoComponent(richItemElement))
+        if len(self.resultComponents) >= self.limit:
+            break
+SearchCore._getComponents = _patched_getComponents
+
+# 5) Fix _parseSource: can set responseSource to None, causing iteration crash
+_original_parseSource = RequestHandler._parseSource
+def _patched_parseSource(self) -> None:
+    try:
+        _original_parseSource(self)
+    except Exception:
+        self.responseSource = []
+        self.continuationKey = None
+    # Ensure responseSource is always iterable
+    if self.responseSource is None:
+        self.responseSource = []
+RequestHandler._parseSource = _patched_parseSource
+
+# =============================================================================
 
 # High-performance cache: 500 searches, 15 minute TTL
 SEARCH_CACHE = TTLCache(maxsize=500, ttl=900)
-BATCH_SIZE = 200  # Fetch 200 videos per search
+BATCH_SIZE = 200  # Fetch large batch for cursor pagination
 
 # Dedicated thread pool for search operations (non-blocking)
 search_executor = ThreadPoolExecutor(max_workers=10)
@@ -233,66 +387,227 @@ def parse_cursor(cursor: str) -> tuple:
         raise ValueError("Invalid cursor format")
 
 
-def search_youtube_ytdlp(query: str, limit: int) -> List[Dict[str, Any]]:
-    """Search YouTube using yt-dlp - runs in separate thread."""
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': True,
-        'skip_download': True,
-        'socket_timeout': 30,
-    }
+def extract_badges_from_response(response_data: Any) -> Dict[str, Dict[str, List[str]]]:
+    """
+    Recursively extracts badges from raw YouTube API response data.
+    Returns a dict mapping id -> {'badges': [], 'ownerBadges': []}.
+    """
+    badges_map = {}
     
-    search_query = f"ytsearch{limit}:{query}"
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        result = ydl.extract_info(search_query, download=False)
-    
-    videos = []
-    if result and 'entries' in result:
-        for entry in result['entries']:
-            if entry:
-                # Format duration
-                duration_seconds = entry.get('duration') or 0
-                if duration_seconds:
-                    minutes, seconds = divmod(int(duration_seconds), 60)
-                    hours, minutes = divmod(minutes, 60)
-                    if hours > 0:
-                        duration_formatted = f"{hours}:{minutes:02d}:{seconds:02d}"
-                    else:
-                        duration_formatted = f"{minutes}:{seconds:02d}"
-                else:
-                    duration_formatted = "N/A"
+    def _extract_recursive(obj):
+        if isinstance(obj, dict):
+            # Check for video/channel ID
+            item_id = None
+            if 'videoId' in obj:
+                item_id = obj['videoId']
+            elif 'channelId' in obj:
+                item_id = obj['channelId']
+            
+            if item_id:
+                extracted = {'badges': [], 'ownerBadges': []}
                 
-                videos.append({
-                    'video_id': entry.get('id'),
+                # Check 'badges' (Video features like 4K, CC)
+                if obj.get('badges'):
+                    for badge_item in obj['badges']:
+                        if isinstance(badge_item, dict) and 'metadataBadgeRenderer' in badge_item:
+                            obr = badge_item['metadataBadgeRenderer']
+                            label = obr.get('label') or obr.get('tooltip')
+                            if not label and 'accessibilityData' in obr:
+                                label = obr['accessibilityData'].get('label')
+                            if label:
+                                extracted['badges'].append(label)
+                
+                # Check 'ownerBadges' (Channel verification)
+                if obj.get('ownerBadges'):
+                    for badge_item in obj['ownerBadges']:
+                        if isinstance(badge_item, dict) and 'metadataBadgeRenderer' in badge_item:
+                            obr = badge_item['metadataBadgeRenderer']
+                            label = obr.get('label') or obr.get('tooltip')
+                            if not label and 'accessibilityData' in obr:
+                                label = obr['accessibilityData'].get('label')
+                            if label:
+                                extracted['ownerBadges'].append(label)
+
+                if extracted['badges'] or extracted['ownerBadges']:
+                    if item_id in badges_map:
+                         badges_map[item_id]['badges'].extend(extracted['badges'])
+                         badges_map[item_id]['ownerBadges'].extend(extracted['ownerBadges'])
+                    else:
+                        badges_map[item_id] = extracted
+            
+            # Recurse values
+            for k, v in obj.items():
+                _extract_recursive(v)
+        
+        elif isinstance(obj, list):
+            for item in obj:
+                _extract_recursive(item)
+
+    _extract_recursive(response_data)
+    return badges_map
+
+
+def _process_results(entries: list, badges_map: dict, limit: int) -> List[Dict[str, Any]]:
+    """Process a batch of search result entries into our output format."""
+    items = []
+    for entry in entries:
+        if len(items) >= limit:
+            break
+        
+        item_type = entry.get('type')
+        
+        # Safe description snippet join
+        desc_snippets = entry.get('descriptionSnippet')
+        description = None
+        if desc_snippets and isinstance(desc_snippets, list):
+            description = "".join([t.get('text') or '' for t in desc_snippets if isinstance(t, dict)])
+        
+        if item_type == 'video':
+            video_id = entry.get('id')
+            extracted_badges = badges_map.get(video_id, {'badges': [], 'ownerBadges': []})
+            video_badges = list(set(extracted_badges['badges']))
+            owner_badges = list(set(extracted_badges['ownerBadges']))
+            channel_info = entry.get('channel') or {}
+            
+            video_obj = {
+                'author': {
+                    'avatar': channel_info.get('thumbnails') or [],
+                    'badges': owner_badges,
+                    'canonicalBaseUrl': None,
+                    'channelId': channel_info.get('id'),
+                    'title': channel_info.get('name'),
+                    'url': channel_info.get('link')
+                },
+                'badges': video_badges,
+                'descriptionSnippet': description,
+                'isLiveNow': entry.get('isLiveNow', False),
+                'lengthSeconds': entry.get('duration'),
+                'publishedTimeText': entry.get('publishedTime'),
+                'stats': {
+                    'views': (entry.get('viewCount') or {}).get('text')
+                },
+                'thumbnails': entry.get('thumbnails') or [],
+                'title': entry.get('title'),
+                'videoId': video_id,
+                'canonicalBaseUrl': None,
+                'url': entry.get('link')
+            }
+            items.append({'type': 'video', 'video': video_obj})
+            
+        elif item_type == 'channel':
+            handle = (entry.get('subscribers') or '').strip()
+            canonical_base_url = f"/{handle}" if handle and handle.startswith('@') else None
+            
+            channel_obj = {
+                'type': 'channel',
+                'channel': {
+                    'avatar': entry.get('thumbnails') or [],
+                    'badges': badges_map.get(entry.get('id'), {}).get('ownerBadges', []),
+                    'canonicalBaseUrl': canonical_base_url,
+                    'channelId': entry.get('id'),
+                    'descriptionSnippet': description,
+                    'stats': {'subscribersText': entry.get('subscribers')},
                     'title': entry.get('title'),
-                    'channel': entry.get('channel') or entry.get('uploader'),
-                    'duration': duration_formatted,
-                    'duration_seconds': duration_seconds,
-                    'views': entry.get('view_count'),
-                    'thumbnail': entry.get('thumbnail') or f"https://i.ytimg.com/vi/{entry.get('id')}/hqdefault.jpg",
-                    'url': f"https://www.youtube.com/watch?v={entry.get('id')}"
-                })
+                    'username': handle,
+                    'url': entry.get('link')
+                },
+                'canonicalBaseUrl': canonical_base_url,
+                'url': entry.get('link')
+            }
+            items.append(channel_obj)
+        else:
+            items.append({
+                'type': item_type,
+                'title': entry.get('title'),
+                'id': entry.get('id'),
+                'thumbnails': entry.get('thumbnails') or [],
+                'link': entry.get('link'),
+                'descriptionSnippet': description,
+            })
+    return items
+
+
+def _extract_badges_safe(search_obj) -> dict:
+    """Safely extract badges from a Search object's raw response."""
+    badges_map = {}
+    if hasattr(search_obj, 'response'):
+        try:
+            raw = search_obj.response
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            badges_map = extract_badges_from_response(raw)
+        except Exception:
+            pass
+    return badges_map
+
+
+def search_youtube_first_page(query: str, limit: int):
+    """Fast first-page search (~1s, 1 HTTP request). Returns (items, search_obj, badges_map)."""
+    search = Search(query, limit=limit)
+    results = search.result()
     
-    return videos
+    if not results or not results.get('result'):
+        return [], search, {}
+    
+    badges_map = _extract_badges_safe(search)
+    items = _process_results(results['result'], badges_map, limit)
+    return items, search, badges_map
+
+
+def _background_fetch_remaining(search_id: str, search_obj, badges_map: dict, current_items: list, target: int):
+    """Background thread: fetch more pages and update cache in-place."""
+    try:
+        items = list(current_items)  # copy
+        while len(items) < target:
+            try:
+                search_obj.next()
+                results = search_obj.result()
+                if not results or not results.get('result'):
+                    break
+                
+                new_badges = _extract_badges_safe(search_obj)
+                badges_map.update(new_badges)
+                
+                new_items = _process_results(results['result'], badges_map, target - len(items))
+                if not new_items:
+                    break
+                items.extend(new_items)
+                
+                # Update cache progressively so cursor requests get latest data
+                cache_data = SEARCH_CACHE.get(search_id)
+                if cache_data:
+                    cache_data["videos"] = items
+            except Exception:
+                break
+        
+        logger.info(f"Background fetch complete: {len(items)} total results (search_id={search_id})")
+        # Mark fetching as done
+        cache_data = SEARCH_CACHE.get(search_id)
+        if cache_data:
+            cache_data["fetching"] = False
+    except Exception as e:
+        logger.error(f"Background fetch error: {e}")
+        cache_data = SEARCH_CACHE.get(search_id)
+        if cache_data:
+            cache_data["fetching"] = False
 
 
 @app.get("/search", tags=["Search"])
-async def search_youtube(query: str = None, cursor: str = None, limit: int = 50):
+async def search_youtube(query: str = None, cursor: str = None):
     """
-    Search YouTube videos with caching cursor pagination.
+    Search YouTube videos with rich metadata (thumbnails, badges, etc.).
     
-    - **query**: Search query string (required for new search)
-    - **cursor**: Cursor token for pagination (from previous response)
-    - **limit**: Results per page (default: 50)
+    - **query**: Search query string
+    - **cursor**: Pagination cursor
+    - **limit**: Results per page (default: 20)
     """
+    limit: int = 20
     try:
         # Validate limit
         if limit < 1:
             limit = 1
-        elif limit > 100:
-            limit = 100
+        elif limit > 200:
+            limit = 200
         
         cached = False
         offset = 0
@@ -301,7 +616,15 @@ async def search_youtube(query: str = None, cursor: str = None, limit: int = 50)
         
         if cursor:
             # Pagination request - get from cache (instant)
-            search_id, offset = parse_cursor(cursor)
+            try:
+                search_id, offset = parse_cursor(cursor)
+            except (ValueError, Exception):
+                return {
+                    "status": "error",
+                    "error": "Cursor expired or invalid. Please start a new search.",
+                    "code" : "404"
+                }
+            
             cache_data = SEARCH_CACHE.get(search_id)
             
             if not cache_data:
@@ -311,31 +634,53 @@ async def search_youtube(query: str = None, cursor: str = None, limit: int = 50)
                     "code" : "404"
                 }
             
+            # Validate cursor belongs to the given query (if query provided)
+            cached_query = cache_data["query"]
+            if query and query.strip().lower() != cached_query.strip().lower():
+                return {
+                    "status": "error",
+                    "error": "Cursor does not belong to this query. Please start a new search.",
+                    "code" : "400"
+                }
+            
             all_videos = cache_data["videos"]
-            query = cache_data["query"]
+            query = cached_query
             cached = True
             logger.info(f"Cache hit: search_id={search_id}, offset={offset}")
             
         elif query:
-            # New search - fetch batch and cache
+            # New search - fast first page + background fetch for remaining
             search_id = generate_search_id(query)
-            logger.info(f"New search: '{query}' (search_id={search_id}, batch={BATCH_SIZE})")
+            logger.info(f"New search: '{query}' (search_id={search_id})")
             
-            # Run in dedicated thread pool - non-blocking for other requests
+            # Fast: fetch first page only (1 HTTP request, ~1s)
+            FIRST_PAGE_SIZE = 20
             loop = asyncio.get_event_loop()
-            all_videos = await loop.run_in_executor(
-                search_executor, 
-                search_youtube_ytdlp, 
-                query, 
-                BATCH_SIZE
+            first_items, search_obj, badges_map = await loop.run_in_executor(
+                search_executor,
+                search_youtube_first_page,
+                query,
+                FIRST_PAGE_SIZE
             )
             
-            # Cache results for fast subsequent access
+            all_videos = first_items
+            
+            # Cache first page immediately with fetching flag
+            bg_fetching = len(all_videos) > 0  # will fetch more in background
             SEARCH_CACHE[search_id] = {
                 "query": query,
-                "videos": all_videos
+                "videos": all_videos,
+                "fetching": bg_fetching
             }
             logger.info(f"Cached {len(all_videos)} videos (search_id={search_id})")
+            
+            # Background: fetch remaining pages (non-blocking)
+            if bg_fetching:
+                search_executor.submit(
+                    _background_fetch_remaining,
+                    search_id, search_obj, badges_map,
+                    all_videos, BATCH_SIZE
+                )
             
         else:
             return {
@@ -348,8 +693,16 @@ async def search_youtube(query: str = None, cursor: str = None, limit: int = 50)
         videos = all_videos[offset:offset + limit]
         
         # Calculate next/prev cursors
-        next_offset = offset + limit
-        next_cursor = f"{search_id}:{next_offset}" if next_offset < len(all_videos) else None
+        # Use actual count returned (not limit) so cursor points to real next position
+        next_offset = offset + len(videos)
+        cache_data = SEARCH_CACHE.get(search_id, {})
+        still_fetching = cache_data.get("fetching", False)
+        
+        # Provide next_cursor if there are more cached results OR background is still fetching
+        if next_offset < len(all_videos) or (still_fetching and len(videos) > 0):
+            next_cursor = f"{search_id}:{next_offset}"
+        else:
+            next_cursor = None
         
         prev_cursor = None
         if offset > 0:

@@ -7,3 +7,5 @@ yt-dlp
 google-api-python-client
 python-dotenv
 cachetools
+
+youtube-search-python>=1.6.6
