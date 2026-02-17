@@ -172,13 +172,18 @@ async def transcript(video_url: str, target_language: str = "en"):
             )
         except Exception as e:
             logger.error(f"Failed after {MAX_RETRIES} retries: {e}")
-            raise HTTPException(status_code=200, detail="Sorry, a transcript isn't available for this video.")
+            return {
+                "status": "not_available",
+                "message": "Transcript is not available for this video.",
+                "transcript": None
+            }
         
         # Build full transcript text
         full_transcript = " ".join([seg['text'] for seg in segments])
         
         
         return {
+            "status": "success",
             "transcript": full_transcript,
             "segments": segments,
             "language": actual_language,
@@ -293,10 +298,11 @@ async def search_youtube(query: str = None, cursor: str = None, limit: int = 50)
             cache_data = SEARCH_CACHE.get(search_id)
             
             if not cache_data:
-                raise HTTPException(
-                    status_code=200, 
-                    detail="Cursor expired or invalid. Please start a new search."
-                )
+                return {
+                    "status": "not_available",
+                    "message": "Cursor expired or invalid. Please start a new search.",
+                    "videos": None
+                }
             
             all_videos = cache_data["videos"]
             query = cache_data["query"]
@@ -325,10 +331,11 @@ async def search_youtube(query: str = None, cursor: str = None, limit: int = 50)
             logger.info(f"Cached {len(all_videos)} videos (search_id={search_id})")
             
         else:
-            raise HTTPException(
-                status_code=200, 
-                detail="Either 'query' or 'cursor' parameter is required"
-            )
+            return {
+                "status": "not_available",
+                "message": "Either 'query' or 'cursor' parameter is required",
+                "videos": None
+            }
         
         # Get slice for current page
         videos = all_videos[offset:offset + limit]
@@ -343,6 +350,7 @@ async def search_youtube(query: str = None, cursor: str = None, limit: int = 50)
             prev_cursor = f"{search_id}:{prev_offset}"
         
         return {
+            "status": "success",
             "query": query,
             "count": len(videos),
             "offset": offset,
@@ -462,12 +470,20 @@ async def convert_to_mp3(video_url: str, background_tasks: BackgroundTasks):
             )
         except asyncio.TimeoutError:
             logger.error(f"Download timeout for video: {video_id}")
-            raise HTTPException(status_code=200, detail="Download timeout - video may be too long or network is slow")
+            return {
+                "status": "not_available",
+                "message": "Download timeout - video may be too long or network is slow",
+                "file": None
+            }
         
         # Verify file exists
         if not os.path.exists(internal_file):
             logger.error(f"Output file not found: {internal_file}")
-            raise HTTPException(status_code=200, detail="Conversion failed: Output file not found")
+            return {
+                "status": "not_available",
+                "message": "Conversion failed: Output file not found",
+                "file": None
+            }
         
         # Schedule cleanup after response
         background_tasks.add_task(cleanup_file, internal_file)
@@ -481,10 +497,18 @@ async def convert_to_mp3(video_url: str, background_tasks: BackgroundTasks):
         )
         
     except ValueError as e:
-        raise HTTPException(status_code=200, detail=str(e))
+        return {
+            "status": "not_available",
+            "message": str(e),
+            "file": None
+        }
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Conversion error: {e}")
-        raise HTTPException(status_code=200, detail=f"Conversion failed: {str(e)}")
+        return {
+            "status": "not_available",
+            "message": "Conversion failed: " + str(e),
+            "file": None
+        }
 
