@@ -14,7 +14,6 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from fake_useragent import UserAgent
 from fastapi import FastAPI, HTTPException
 import yt_dlp
-import yt_dlp
 from concurrent.futures import ThreadPoolExecutor
 import json
 
@@ -27,11 +26,12 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Create API instance (no proxies)
-ytt_api = YouTubeTranscriptApi()
-
 # Max retries for getting a good request/handling rate limits
 MAX_RETRIES = 1
+
+# Transcript cache: avoid re-fetching the same video transcript
+from cachetools import TTLCache
+TRANSCRIPT_CACHE = TTLCache(maxsize=500, ttl=600)  # 10 min TTL
 
 # Initialize UserAgent
 ua = UserAgent()
@@ -39,6 +39,7 @@ ua = UserAgent()
 def extract_video_id(url: str) -> str:
     """Extract video ID from various YouTube URL formats."""
     patterns = [
+        r'(?:/shorts/)([a-zA-Z0-9_-]{11})',
         r'(?:v=|/v/|youtu\.be/|/embed/)([a-zA-Z0-9_-]{11})',
         r'^([a-zA-Z0-9_-]{11})$'
     ]
@@ -61,91 +62,82 @@ def snippet_to_dict(snippet) -> Dict[str, Any]:
 def fetch_transcript_with_retry(video_id: str, target_language: str, max_retries: int = MAX_RETRIES):
     """
     Fetch transcript with retry mechanism and rotating User-Agents.
+    Uses per-request API instance for thread safety and a cache for instant repeats.
     """
+    # Check cache first — instant return on cache hit
+    cache_key = f"{video_id}:{target_language}"
+    cached = TRANSCRIPT_CACHE.get(cache_key)
+    if cached is not None:
+        logger.info(f"Cache hit for transcript: {video_id} ({target_language})")
+        return cached
+
     last_error = None
     
     for attempt in range(max_retries):
         try:
-            # Generate and set new User-Agent for this attempt
-            # Rotate between Chrome, Firefox, and Opera
-            browser_type = ['chrome', 'firefox', 'opera'][attempt % 3]
-            try:
-                new_ua = getattr(ua, browser_type)
-            except Exception:
-                # Fallback to random if specific type fails
-                new_ua = ua.random
+            # Create a fresh API instance per request (thread-safe, no shared state)
+            api = YouTubeTranscriptApi()
 
-            # Access internal session to update headers
-            # Note: _fetcher and _http_client are internal attributes, but necessary here
-            if hasattr(ytt_api, '_fetcher') and hasattr(ytt_api._fetcher, '_http_client'):
-                 ytt_api._fetcher._http_client.headers['User-Agent'] = new_ua
-                 logger.info(f"Attempt {attempt + 1}/{max_retries} - using User-Agent ({browser_type}): {new_ua[:30]}...")
+            # Set a random User-Agent
+            new_ua = ua.random
+            if hasattr(api, '_fetcher') and hasattr(api._fetcher, '_http_client'):
+                api._fetcher._http_client.headers['User-Agent'] = new_ua
             
             # List available transcripts
-            transcript_list = ytt_api.list(video_id)
+            transcript_list = api.list(video_id)
             
-            # Try to find a transcript
+            # Try to find a transcript — fast path: target language first
             transcript_obj = None
             actual_language = target_language
             
-            # First, try to get transcript in target language directly
             try:
                 transcript_obj = transcript_list.find_manually_created_transcript([target_language])
-                logger.info(f"Found manual transcript in {target_language}")
-            except:
+            except Exception:
                 try:
                     transcript_obj = transcript_list.find_generated_transcript([target_language])
-                    logger.info(f"Found auto-generated transcript in {target_language}")
-                except:
+                except Exception:
                     pass
             
-            # If not found in target language, get any transcript and try to translate
+            # Fallback: English or any available transcript
             if transcript_obj is None:
                 try:
                     transcript_obj = transcript_list.find_manually_created_transcript(['en'])
-                    logger.info("Found manual English transcript")
-                except:
+                except Exception:
                     try:
                         transcript_obj = transcript_list.find_generated_transcript(['en'])
-                        logger.info("Found auto-generated English transcript")
-                    except:
+                    except Exception:
                         for t in transcript_list:
                             transcript_obj = t
-                            logger.info(f"Using transcript in {t.language_code}")
                             break
                 
                 # Try to translate to target language
                 if transcript_obj and target_language != transcript_obj.language_code:
                     try:
-                        logger.info(f"Translating to {target_language}...")
                         transcript_obj = transcript_obj.translate(target_language)
-                    except Exception as translate_error:
-                        # Translation not available - return original language instead
-                        logger.warning(f"Translation not available: {translate_error}")
-                        logger.info(f"Returning transcript in original language: {transcript_obj.language_code}")
+                    except Exception:
                         actual_language = transcript_obj.language_code
             
             if transcript_obj is None:
                 raise Exception("No transcript found")
             
             # Fetch the segments
-            fetched_transcript = transcript_obj.fetch()
+            segments = [snippet_to_dict(s) for s in transcript_obj.fetch()]
             
-            # Convert to dict
-            segments = [snippet_to_dict(snippet) for snippet in fetched_transcript]
-                
-            logger.info(f"Success! Fetched {len(segments)} segments")
+            logger.info(f"Fetched {len(segments)} segments for {video_id}")
             
-            return segments, actual_language
+            # Cache the result
+            result = (segments, actual_language)
+            TRANSCRIPT_CACHE[cache_key] = result
+            
+            return result
             
         except Exception as e:
-            # Don't retry if it's a translation issue - that won't change
             if "not translatable" in str(e).lower():
                 raise e
             last_error = e
             logger.warning(f"Attempt {attempt + 1} failed: {e}")
             if attempt < max_retries - 1:
-                time.sleep(1)  # Wait before retry
+                time.sleep(0.3)
     
     raise last_error
 
@@ -787,8 +779,12 @@ def download_video_sync(video_url: str, output_path: str) -> bool:
         }],
         'quiet': True,
         'no_warnings': True,
-        'socket_timeout': 30,
-        'retries': 3,
+        'socket_timeout': 15,
+        'retries': 2,
+        'concurrent_fragment_downloads': 8,
+        'buffersize': 1024 * 1024,
+        'noprogress': True,
+        'noplaylist': True,
     }
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -797,7 +793,7 @@ def download_video_sync(video_url: str, output_path: str) -> bool:
     return True
 
 
-@app.post("/convert", tags=["Conversion"])
+@app.get("/convert", tags=["Conversion"])
 async def convert_to_mp3(video_url: str, background_tasks: BackgroundTasks):
     """
     Download YouTube video and convert to MP3.
@@ -875,3 +871,100 @@ async def convert_to_mp3(video_url: str, background_tasks: BackgroundTasks):
             "code" : "400"
         }
 
+# --- YouTube Shorts Download Feature ---
+
+def download_short_sync(video_url: str, output_path: str) -> bool:
+    """Synchronous video download function for YouTube Shorts."""
+    ydl_opts = {
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'merge_output_format': 'mp4',
+        'outtmpl': output_path,
+        'quiet': True,
+        'no_warnings': True,
+        'socket_timeout': 15,
+        'retries': 2,
+        'concurrent_fragment_downloads': 8,
+        'buffersize': 1024 * 1024,
+        'noprogress': True,
+        'noplaylist': True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([video_url])
+
+    return True
+
+
+@app.get("/download-short", tags=["Shorts"])
+async def download_short(video_url: str, background_tasks: BackgroundTasks):
+    """
+    Download a YouTube Shorts video as MP4.
+
+    - **video_url**: YouTube Shorts URL or video ID
+
+    Example: `curl "API_URL/download-short?video_url=https://www.youtube.com/shorts/VIDEO_ID"`
+    """
+    try:
+        # Extract and validate video ID
+        video_id = extract_video_id(video_url)
+
+        # Build clean Shorts URL
+        clean_video_url = f"https://www.youtube.com/shorts/{video_id}"
+
+        logger.info(f"Downloading short video: {video_id}")
+
+        # Generate unique filename to avoid conflicts
+        unique_id = uuid.uuid4().hex[:8]
+        output_filename = f"{video_id}.mp4"
+        internal_file = f"downloads/{video_id}_{unique_id}.mp4"
+
+        # Download with timeout protection
+        loop = asyncio.get_event_loop()
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(executor, download_short_sync, clean_video_url, internal_file),
+                timeout=DOWNLOAD_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Download timeout for short video: {video_id}")
+            return {
+                "status": "error",
+                "error": "Download timed out. Video may be too long.",
+                "code": "400"
+            }
+
+        # Verify file exists
+        if not os.path.exists(internal_file):
+            logger.error(f"Output file not found: {internal_file}")
+            return {
+                "status": "error",
+                "error": "Download failed",
+                "code": "400"
+            }
+
+        # Schedule cleanup after response is sent
+        background_tasks.add_task(cleanup_file, internal_file)
+
+        logger.info(f"Download complete: {video_id} -> {output_filename}")
+
+        return FileResponse(
+            path=internal_file,
+            filename=output_filename,
+            media_type="video/mp4"
+        )
+
+    except ValueError as e:
+        return {
+            "status": "error",
+            "error": "Invalid video URL",
+            "code": "400"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Short download error: {e}")
+        return {
+            "status": "error",
+            "error": "Download failed",
+            "code": "400"
+        }
